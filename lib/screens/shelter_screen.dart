@@ -101,6 +101,7 @@ class _ShelterScreenState extends State<ShelterScreen> with SingleTickerProvider
 
   TileProvider? _tileProvider;
   final _mapController = MapController();
+  bool _isLocating = false;
 
   @override
   void initState() {
@@ -223,6 +224,37 @@ class _ShelterScreenState extends State<ShelterScreen> with SingleTickerProvider
     // TODO: 替換為 http.get(Uri.parse('https://your-api/shelters'))
     await Future.delayed(const Duration(milliseconds: 400));
     _shelters = _serverShelters.map((s) => Shelter.fromJson(s.toJson())).toList();
+  }
+
+  // ── 移動地圖到我的位置 ────────────────────────────────────
+  Future<void> _locateMe() async {
+    setState(() => _isLocating = true);
+    try {
+      LocationPermission permission = await Geolocator.checkPermission();
+      if (permission == LocationPermission.denied) {
+        permission = await Geolocator.requestPermission();
+      }
+      if (permission == LocationPermission.denied || permission == LocationPermission.deniedForever) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('請開啟位置權限以使用此功能')),
+          );
+        }
+        return;
+      }
+      final pos = await Geolocator.getCurrentPosition(
+        locationSettings: const LocationSettings(accuracy: LocationAccuracy.high),
+      ).timeout(const Duration(seconds: 8));
+      _currentLocation = LatLng(pos.latitude, pos.longitude);
+      _mapController.move(_currentLocation!, 15.5);
+      setState(() {});
+    } on TimeoutException {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('位置偵測逾時，請稍後再試')));
+    } catch (_) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('無法取得位置')));
+    } finally {
+      if (mounted) setState(() => _isLocating = false);
+    }
   }
 
   // ── 離線載入快取 ─────────────────────────────────────────
@@ -506,68 +538,101 @@ class _ShelterScreenState extends State<ShelterScreen> with SingleTickerProvider
       return const Center(child: CircularProgressIndicator());
     }
 
-    final center = _frequentLocation ??
-        _currentLocation ??
-        LatLng(_shelters.isNotEmpty ? _shelters[0].lat : 23.962, _shelters.isNotEmpty ? _shelters[0].lng : 120.969);
+    final center = _currentLocation ??
+        _frequentLocation ??
+        LatLng(_shelters.isNotEmpty ? _shelters[0].lat : 23.962,
+               _shelters.isNotEmpty ? _shelters[0].lng : 120.969);
 
-    return FlutterMap(
-      mapController: _mapController,
-      options: MapOptions(
-        initialCenter: center,
-        initialZoom: 14.0,
-        maxZoom: 18,
-        minZoom: 10,
-      ),
+    return Stack(
       children: [
-        // 地圖磚層（支援離線快取）
-        TileLayer(
-          urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
-          userAgentPackageName: 'com.example.disaster_app',
-          tileProvider: _tileProvider!,
-        ),
+        FlutterMap(
+          mapController: _mapController,
+          options: MapOptions(
+            initialCenter: center,
+            initialZoom: 14.5,
+            maxZoom: 19,
+            minZoom: 10,
+          ),
+          children: [
+            // CartoDB Voyager：清晰、中英文標示、適合導航
+            TileLayer(
+              urlTemplate:
+                  'https://a.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}.png',
+              userAgentPackageName: 'com.example.disaster_app',
+              tileProvider: _tileProvider!,
+              maxNativeZoom: 19,
+            ),
 
-        // 防空洞標記
-        MarkerLayer(
-          markers: [
-            // 使用者常出現位置（藍色）
-            if (_frequentLocation != null)
-              Marker(
-                point: _frequentLocation!,
-                width: 44,
-                height: 44,
-                child: _UserLocationMarker(label: '常出現位置'),
-              ),
-            // 當前 GPS 位置（若與常出現位置不同）
-            if (_currentLocation != null && _frequentLocation != null &&
-                _calcDistKm(_currentLocation!.latitude, _currentLocation!.longitude,
-                        _frequentLocation!.latitude, _frequentLocation!.longitude) >
-                    0.05)
-              Marker(
-                point: _currentLocation!,
-                width: 36,
-                height: 36,
-                child: _CurrentPosMarker(),
-              ),
-            // 避難所標記
-            ..._shelters.asMap().entries.map((entry) {
-              final index = entry.key;
-              final s = entry.value;
-              return Marker(
-                point: LatLng(s.lat, s.lng),
-                width: 44,
-                height: 54,
-                child: GestureDetector(
-                  onTap: () => _showShelterInfo(s, index),
-                  child: _ShelterMarker(number: index + 1, isNearest: index == 0),
-                ),
-              );
-            }),
+            // 防空洞標記
+            MarkerLayer(
+              markers: [
+                // 常出現位置（若與當前位置不同才顯示）
+                if (_frequentLocation != null &&
+                    (_currentLocation == null ||
+                        _calcDistKm(
+                              _frequentLocation!.latitude,
+                              _frequentLocation!.longitude,
+                              _currentLocation!.latitude,
+                              _currentLocation!.longitude,
+                            ) >
+                            0.05))
+                  Marker(
+                    point: _frequentLocation!,
+                    width: 44,
+                    height: 44,
+                    child: const _UserLocationMarker(label: '常出現位置'),
+                  ),
+
+                // 當前 GPS 位置（藍點）
+                if (_currentLocation != null)
+                  Marker(
+                    point: _currentLocation!,
+                    width: 56,
+                    height: 56,
+                    child: _CurrentPosMarker(),
+                  ),
+
+                // 避難所標記
+                ..._shelters.asMap().entries.map((entry) {
+                  final index = entry.key;
+                  final s = entry.value;
+                  return Marker(
+                    point: LatLng(s.lat, s.lng),
+                    width: 44,
+                    height: 54,
+                    child: GestureDetector(
+                      onTap: () => _showShelterInfo(s, index),
+                      child: _ShelterMarker(number: index + 1, isNearest: index == 0),
+                    ),
+                  );
+                }),
+              ],
+            ),
+
+            const SimpleAttributionWidget(
+              source: Text('© CartoDB © OpenStreetMap', style: TextStyle(fontSize: 10)),
+            ),
           ],
         ),
 
-        // 比例尺
-        const SimpleAttributionWidget(
-          source: Text('© OpenStreetMap contributors', style: TextStyle(fontSize: 10)),
+        // 我的位置按鈕
+        Positioned(
+          right: 16,
+          bottom: 32,
+          child: FloatingActionButton(
+            heroTag: 'locateMe',
+            mini: false,
+            backgroundColor: Colors.white,
+            elevation: 4,
+            onPressed: _isLocating ? null : _locateMe,
+            child: _isLocating
+                ? const SizedBox(
+                    width: 22,
+                    height: 22,
+                    child: CircularProgressIndicator(strokeWidth: 2.5, color: Color(0xFF4A90D9)),
+                  )
+                : const Icon(Icons.my_location_rounded, color: Color(0xFF4A90D9), size: 26),
+          ),
         ),
       ],
     );
