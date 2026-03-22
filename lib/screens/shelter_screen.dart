@@ -1,16 +1,25 @@
 import 'dart:convert';
+import 'dart:math';
+import 'dart:ui' as ui;
 import 'package:flutter/material.dart';
 import 'package:connectivity_plus/connectivity_plus.dart';
+import 'package:flutter_map/flutter_map.dart';
+import 'package:flutter_map_cache/flutter_map_cache.dart';
+import 'package:dio_cache_interceptor_hive_store/dio_cache_interceptor_hive_store.dart';
+import 'package:geolocator/geolocator.dart';
+import 'package:latlong2/latlong.dart';
+import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
 
-// ── 防空洞資料模型 ──────────────────────────────────────────
+// ── 防空洞資料模型 ─────────────────────────────────────────
 class Shelter {
   final String name;
   final double lat;
   final double lng;
   final String capacity;
   final String status;
+  double? distanceKm; // 執行時計算
 
   Shelter({
     required this.name,
@@ -18,6 +27,7 @@ class Shelter {
     required this.lng,
     required this.capacity,
     required this.status,
+    this.distanceKm,
   });
 
   Map<String, dynamic> toJson() => {
@@ -37,7 +47,7 @@ class Shelter {
       );
 }
 
-// ── 模擬伺服器資料（實際上線時替換為 API 呼叫）──────────────
+// ── 模擬伺服器資料（上線時替換為 API 呼叫）────────────────
 final _serverShelters = [
   Shelter(name: '埔里地下停車場', lat: 23.964, lng: 120.967, capacity: '500 人', status: '開放中'),
   Shelter(name: '南投縣政府防空洞', lat: 23.960, lng: 120.972, capacity: '300 人', status: '開放中'),
@@ -48,6 +58,17 @@ final _serverShelters = [
 
 const _prefsKeyShelters = 'offline_shelters';
 const _prefsKeyUpdatedAt = 'shelters_updated_at';
+const _prefsKeyLocHistory = 'location_history'; // [{lat, lng}]
+
+// ── 距離計算（Haversine 公式）────────────────────────────
+double _calcDistKm(double lat1, double lon1, double lat2, double lon2) {
+  const r = 6371.0;
+  final dLat = (lat2 - lat1) * pi / 180;
+  final dLon = (lon2 - lon1) * pi / 180;
+  final a = sin(dLat / 2) * sin(dLat / 2) +
+      cos(lat1 * pi / 180) * cos(lat2 * pi / 180) * sin(dLon / 2) * sin(dLon / 2);
+  return r * 2 * atan2(sqrt(a), sqrt(1 - a));
+}
 
 // ── 主畫面 ─────────────────────────────────────────────────
 class ShelterScreen extends StatefulWidget {
@@ -57,7 +78,7 @@ class ShelterScreen extends StatefulWidget {
   State<ShelterScreen> createState() => _ShelterScreenState();
 }
 
-class _ShelterScreenState extends State<ShelterScreen> {
+class _ShelterScreenState extends State<ShelterScreen> with SingleTickerProviderStateMixin {
   static const _bg = Color(0xFFF7F3EC);
   static const _card = Color(0xFFFEFDF9);
   static const _textPrimary = Color(0xFF3D2C1E);
@@ -65,29 +86,59 @@ class _ShelterScreenState extends State<ShelterScreen> {
   static const _green = Color(0xFF7AA67A);
   static const _orange = Color(0xFFBF7A5A);
 
+  late final TabController _tabController;
+
   bool _isOnline = false;
   bool _isLoading = true;
   bool _isSaving = false;
+
   List<Shelter> _shelters = [];
   String? _lastUpdatedAt;
+  LatLng? _frequentLocation;  // 常出現的位置（質心）
+  LatLng? _currentLocation;   // 當前 GPS 位置
+  String _locationLabel = '偵測位置中…';
+
+  TileProvider? _tileProvider;
+  final _mapController = MapController();
 
   @override
   void initState() {
     super.initState();
+    _tabController = TabController(length: 2, vsync: this);
     _init();
   }
 
-  Future<void> _init() async {
-    final result = await Connectivity().checkConnectivity();
-    final online = result.any((r) => r != ConnectivityResult.none);
+  @override
+  void dispose() {
+    _tabController.dispose();
+    _mapController.dispose();
+    super.dispose();
+  }
 
+  // ── 初始化 ──────────────────────────────────────────────
+  Future<void> _init() async {
+    final connectivity = await Connectivity().checkConnectivity();
+    final online = connectivity.any((r) => r != ConnectivityResult.none);
+
+    // 設定地圖磚快取（持久化到硬碟）
+    final dir = await getApplicationCacheDirectory();
+    _tileProvider = CachedTileProvider(
+      store: HiveCacheStore('${dir.path}/map_tiles'),
+      maxStale: const Duration(days: 30),
+    );
+
+    // 取得 GPS 位置並更新常出現位置
+    await _updateLocation();
+
+    // 載入避難所資料
     if (online) {
-      // 有網路：從伺服器取得最新資料
       await _loadOnlineData();
     } else {
-      // 無網路：讀取上次下載的快取
       await _loadOfflineData();
     }
+
+    // 依距離排序
+    _sortByDistance();
 
     setState(() {
       _isOnline = online;
@@ -95,12 +146,70 @@ class _ShelterScreenState extends State<ShelterScreen> {
     });
   }
 
-  Future<void> _loadOnlineData() async {
-    // TODO: 替換為實際 API 呼叫，例如 http.get(Uri.parse('https://your-api/shelters'))
-    await Future.delayed(const Duration(milliseconds: 500)); // 模擬網路延遲
-    _shelters = List.from(_serverShelters);
+  // ── GPS 位置 + 常出現位置計算 ────────────────────────────
+  Future<void> _updateLocation() async {
+    try {
+      bool serviceEnabled = await Geolocator.isLocationServiceEnabled();
+      if (!serviceEnabled) {
+        setState(() => _locationLabel = '位置服務未開啟');
+        return;
+      }
+
+      LocationPermission permission = await Geolocator.checkPermission();
+      if (permission == LocationPermission.denied) {
+        permission = await Geolocator.requestPermission();
+      }
+      if (permission == LocationPermission.denied || permission == LocationPermission.deniedForever) {
+        setState(() => _locationLabel = '未取得位置權限');
+        return;
+      }
+
+      final pos = await Geolocator.getCurrentPosition(
+        locationSettings: const LocationSettings(accuracy: LocationAccuracy.high),
+      );
+      _currentLocation = LatLng(pos.latitude, pos.longitude);
+
+      // 儲存到歷史記錄（最多保留 30 筆）
+      final prefs = await SharedPreferences.getInstance();
+      final raw = prefs.getString(_prefsKeyLocHistory);
+      final List<Map<String, double>> history = raw != null
+          ? (jsonDecode(raw) as List).map((e) => {'lat': (e['lat'] as num).toDouble(), 'lng': (e['lng'] as num).toDouble()}).toList()
+          : [];
+
+      history.add({'lat': pos.latitude, 'lng': pos.longitude});
+      if (history.length > 30) history.removeAt(0);
+      await prefs.setString(_prefsKeyLocHistory, jsonEncode(history));
+
+      // 計算質心（常出現位置）
+      final avgLat = history.map((e) => e['lat']!).reduce((a, b) => a + b) / history.length;
+      final avgLng = history.map((e) => e['lng']!).reduce((a, b) => a + b) / history.length;
+      _frequentLocation = LatLng(avgLat, avgLng);
+
+      setState(() => _locationLabel = '常出現位置已更新（${history.length} 次記錄）');
+    } catch (e) {
+      setState(() => _locationLabel = '無法取得位置');
+    }
   }
 
+  // ── 依距離排序 ──────────────────────────────────────────
+  void _sortByDistance() {
+    final baseLocation = _frequentLocation ?? _currentLocation;
+    if (baseLocation == null) return;
+
+    for (final s in _shelters) {
+      s.distanceKm = _calcDistKm(baseLocation.latitude, baseLocation.longitude, s.lat, s.lng);
+    }
+    _shelters.sort((a, b) => (a.distanceKm ?? 99).compareTo(b.distanceKm ?? 99));
+  }
+
+  // ── 線上載入資料 ─────────────────────────────────────────
+  Future<void> _loadOnlineData() async {
+    // TODO: 替換為 http.get(Uri.parse('https://your-api/shelters'))
+    await Future.delayed(const Duration(milliseconds: 400));
+    _shelters = _serverShelters.map((s) => Shelter.fromJson(s.toJson())).toList();
+  }
+
+  // ── 離線載入快取 ─────────────────────────────────────────
   Future<void> _loadOfflineData() async {
     final prefs = await SharedPreferences.getInstance();
     final raw = prefs.getString(_prefsKeyShelters);
@@ -112,10 +221,11 @@ class _ShelterScreenState extends State<ShelterScreen> {
     }
   }
 
-  // 下載並儲存離線地圖資料
+  // ── 儲存離線地圖資料 ─────────────────────────────────────
   Future<void> _downloadOfflineMap() async {
     setState(() => _isSaving = true);
-    await _loadOnlineData(); // 確保取得最新資料
+    await _loadOnlineData();
+    _sortByDistance();
 
     final prefs = await SharedPreferences.getInstance();
     final now = DateTime.now();
@@ -123,10 +233,7 @@ class _ShelterScreenState extends State<ShelterScreen> {
         '${now.year}/${now.month.toString().padLeft(2, '0')}/${now.day.toString().padLeft(2, '0')} '
         '${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}';
 
-    await prefs.setString(
-      _prefsKeyShelters,
-      jsonEncode(_shelters.map((s) => s.toJson()).toList()),
-    );
+    await prefs.setString(_prefsKeyShelters, jsonEncode(_shelters.map((s) => s.toJson()).toList()));
     await prefs.setString(_prefsKeyUpdatedAt, nowStr);
 
     setState(() {
@@ -135,9 +242,12 @@ class _ShelterScreenState extends State<ShelterScreen> {
     });
 
     if (mounted) {
+      // 切換到地圖頁，讓使用者瀏覽以快取地圖磚
+      _tabController.animateTo(1);
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: const Text('離線地圖已儲存，無網路時仍可查閱'),
+          content: const Text('避難所清單已儲存。請在地圖上瀏覽目標區域以快取地圖磚，離線時即可查看'),
+          duration: const Duration(seconds: 5),
           behavior: SnackBarBehavior.floating,
           shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
           margin: const EdgeInsets.all(16),
@@ -147,7 +257,7 @@ class _ShelterScreenState extends State<ShelterScreen> {
     }
   }
 
-  // 開啟 GPS 導航（需網路）
+  // ── 開啟 GPS 導航 ────────────────────────────────────────
   Future<void> _openNavigation(Shelter shelter) async {
     final uri = Uri.parse(
       'https://www.google.com/maps/dir/?api=1&destination=${shelter.lat},${shelter.lng}&travelmode=walking',
@@ -157,17 +267,13 @@ class _ShelterScreenState extends State<ShelterScreen> {
     } else {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: const Text('無法開啟地圖，請確認已安裝地圖應用程式'),
-            behavior: SnackBarBehavior.floating,
-            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-            margin: const EdgeInsets.all(16),
-          ),
+          const SnackBar(content: Text('無法開啟地圖應用程式')),
         );
       }
     }
   }
 
+  // ── 建構 UI ──────────────────────────────────────────────
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -176,328 +282,524 @@ class _ShelterScreenState extends State<ShelterScreen> {
         backgroundColor: _bg,
         title: const Text('防空洞地圖'),
         iconTheme: const IconThemeData(color: _textPrimary),
+        bottom: TabBar(
+          controller: _tabController,
+          labelColor: _textPrimary,
+          unselectedLabelColor: _textSecondary,
+          indicatorColor: _green,
+          tabs: const [
+            Tab(icon: Icon(Icons.list_rounded), text: '清單'),
+            Tab(icon: Icon(Icons.map_rounded), text: '地圖'),
+          ],
+        ),
         actions: [
           if (_isOnline)
-            Padding(
-              padding: const EdgeInsets.only(right: 8),
-              child: _isSaving
-                  ? const Padding(
-                      padding: EdgeInsets.all(14),
-                      child: SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2)),
-                    )
-                  : IconButton(
-                      icon: const Icon(Icons.download_rounded, color: _green),
-                      tooltip: '下載離線地圖',
-                      onPressed: _downloadOfflineMap,
-                    ),
-            ),
+            _isSaving
+                ? const Padding(
+                    padding: EdgeInsets.all(14),
+                    child: SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2)),
+                  )
+                : IconButton(
+                    icon: const Icon(Icons.download_rounded, color: _green),
+                    tooltip: '儲存離線資料',
+                    onPressed: _downloadOfflineMap,
+                  ),
         ],
       ),
       body: _isLoading
           ? const Center(child: CircularProgressIndicator())
-          : SafeArea(
-              child: Column(
-                children: [
-                  // ── 網路狀態橫幅 ──
-                  _NetworkBanner(
-                    isOnline: _isOnline,
-                    lastUpdatedAt: _lastUpdatedAt,
-                    onDownload: _isOnline ? _downloadOfflineMap : null,
-                  ),
-
-                  // ── 摘要卡 ──
-                  Padding(
-                    padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
-                      decoration: BoxDecoration(
-                        color: _card,
-                        borderRadius: BorderRadius.circular(18),
-                        boxShadow: [
-                          BoxShadow(
-                            color: const Color(0xFF3D2C1E).withValues(alpha: 0.05),
-                            blurRadius: 10,
-                            offset: const Offset(0, 3),
-                          ),
-                        ],
-                      ),
-                      child: Row(
-                        children: [
-                          Container(
-                            padding: const EdgeInsets.all(10),
-                            decoration: BoxDecoration(
-                              color: _green.withValues(alpha: 0.12),
-                              borderRadius: BorderRadius.circular(12),
-                            ),
-                            child: const Icon(Icons.shield_rounded, color: _green, size: 22),
-                          ),
-                          const SizedBox(width: 12),
-                          Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Text(
-                                _shelters.isEmpty
-                                    ? '尚無避難所資料'
-                                    : '附近共 ${_shelters.length} 個避難所',
-                                style: const TextStyle(
-                                  fontSize: 15,
-                                  fontWeight: FontWeight.w700,
-                                  color: _textPrimary,
-                                ),
-                              ),
-                              Text(
-                                _isOnline ? '線上資料・依距離由近至遠' : '離線資料・依距離由近至遠',
-                                style: TextStyle(fontSize: 12, color: _textSecondary),
-                              ),
-                            ],
-                          ),
-                          const Spacer(),
-                          Container(
-                            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-                            decoration: BoxDecoration(
-                              color: (_isOnline ? _green : _orange).withValues(alpha: 0.1),
-                              borderRadius: BorderRadius.circular(20),
-                            ),
-                            child: Text(
-                              _isOnline ? '即時更新' : '離線模式',
-                              style: TextStyle(
-                                fontSize: 11,
-                                color: _isOnline ? _green : _orange,
-                                fontWeight: FontWeight.w600,
-                              ),
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                  ),
-
-                  const SizedBox(height: 12),
-
-                  // ── 無資料提示 ──
-                  if (_shelters.isEmpty)
-                    Expanded(
-                      child: Center(
-                        child: Column(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            Icon(Icons.cloud_off_rounded, size: 52, color: _textSecondary.withValues(alpha: 0.4)),
-                            const SizedBox(height: 12),
-                            Text(
-                              '尚未下載離線地圖',
-                              style: TextStyle(fontSize: 15, color: _textSecondary),
-                            ),
-                            Text(
-                              '請連上網路後點選右上角下載圖示',
-                              style: TextStyle(fontSize: 13, color: _textSecondary.withValues(alpha: 0.7)),
-                            ),
-                          ],
-                        ),
-                      ),
-                    )
-                  else
-                    // ── 避難所清單 ──
-                    Expanded(
-                      child: ListView.separated(
-                        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
-                        itemCount: _shelters.length,
-                        separatorBuilder: (_, _) => const SizedBox(height: 10),
-                        itemBuilder: (context, index) {
-                          final s = _shelters[index];
-                          final isFull = s.status == '即將滿員';
-                          final statusColor = isFull ? _orange : _green;
-
-                          return Container(
-                            padding: const EdgeInsets.all(16),
-                            decoration: BoxDecoration(
-                              color: _card,
-                              borderRadius: BorderRadius.circular(18),
-                              boxShadow: [
-                                BoxShadow(
-                                  color: const Color(0xFF3D2C1E).withValues(alpha: 0.05),
-                                  blurRadius: 10,
-                                  offset: const Offset(0, 3),
-                                ),
-                              ],
-                            ),
-                            child: Row(
-                              children: [
-                                // 編號圓
-                                Container(
-                                  width: 40,
-                                  height: 40,
-                                  decoration: BoxDecoration(
-                                    color: _green.withValues(alpha: 0.1),
-                                    shape: BoxShape.circle,
-                                  ),
-                                  child: Center(
-                                    child: Text(
-                                      '${index + 1}',
-                                      style: const TextStyle(
-                                        fontSize: 15,
-                                        fontWeight: FontWeight.w800,
-                                        color: _green,
-                                      ),
-                                    ),
-                                  ),
-                                ),
-                                const SizedBox(width: 14),
-                                Expanded(
-                                  child: Column(
-                                    crossAxisAlignment: CrossAxisAlignment.start,
-                                    children: [
-                                      Text(
-                                        s.name,
-                                        style: const TextStyle(
-                                          fontSize: 15,
-                                          fontWeight: FontWeight.w700,
-                                          color: _textPrimary,
-                                        ),
-                                      ),
-                                      const SizedBox(height: 6),
-                                      Row(
-                                        children: [
-                                          Icon(Icons.people_outline_rounded, size: 13, color: _textSecondary),
-                                          const SizedBox(width: 3),
-                                          Text(s.capacity, style: TextStyle(fontSize: 12, color: _textSecondary)),
-                                          const SizedBox(width: 10),
-                                          Icon(Icons.location_on_outlined, size: 13, color: _textSecondary),
-                                          const SizedBox(width: 3),
-                                          Text(
-                                            '${s.lat.toStringAsFixed(3)}, ${s.lng.toStringAsFixed(3)}',
-                                            style: TextStyle(fontSize: 11, color: _textSecondary),
-                                          ),
-                                        ],
-                                      ),
-                                    ],
-                                  ),
-                                ),
-                                const SizedBox(width: 8),
-                                Column(
-                                  crossAxisAlignment: CrossAxisAlignment.end,
-                                  children: [
-                                    Container(
-                                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-                                      decoration: BoxDecoration(
-                                        color: statusColor.withValues(alpha: 0.1),
-                                        borderRadius: BorderRadius.circular(20),
-                                      ),
-                                      child: Text(
-                                        s.status,
-                                        style: TextStyle(
-                                          fontSize: 11,
-                                          fontWeight: FontWeight.w600,
-                                          color: statusColor,
-                                        ),
-                                      ),
-                                    ),
-                                    const SizedBox(height: 8),
-                                    // 導航按鈕：有網路才可點
-                                    GestureDetector(
-                                      onTap: _isOnline ? () => _openNavigation(s) : null,
-                                      child: Row(
-                                        children: [
-                                          Icon(
-                                            Icons.directions_rounded,
-                                            size: 14,
-                                            color: _isOnline ? _green : _textSecondary.withValues(alpha: 0.35),
-                                          ),
-                                          const SizedBox(width: 3),
-                                          Text(
-                                            '導航',
-                                            style: TextStyle(
-                                              fontSize: 12,
-                                              color: _isOnline ? _green : _textSecondary.withValues(alpha: 0.35),
-                                              fontWeight: _isOnline ? FontWeight.w600 : FontWeight.normal,
-                                            ),
-                                          ),
-                                        ],
-                                      ),
-                                    ),
-                                  ],
-                                ),
-                              ],
-                            ),
-                          );
-                        },
-                      ),
-                    ),
-                ],
-              ),
-            ),
-    );
-  }
-}
-
-// ── 網路狀態橫幅元件 ──────────────────────────────────────
-class _NetworkBanner extends StatelessWidget {
-  final bool isOnline;
-  final String? lastUpdatedAt;
-  final VoidCallback? onDownload;
-
-  const _NetworkBanner({required this.isOnline, this.lastUpdatedAt, this.onDownload});
-
-  @override
-  Widget build(BuildContext context) {
-    if (isOnline) {
-      return Container(
-        width: double.infinity,
-        color: const Color(0xFF7AA67A).withValues(alpha: 0.12),
-        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-        child: Row(
-          children: [
-            const Icon(Icons.wifi_rounded, size: 15, color: Color(0xFF7AA67A)),
-            const SizedBox(width: 6),
-            const Text(
-              '已連線・顯示最新防空洞位置',
-              style: TextStyle(fontSize: 12, color: Color(0xFF5C8A5C), fontWeight: FontWeight.w600),
-            ),
-            const Spacer(),
-            GestureDetector(
-              onTap: onDownload,
-              child: const Row(
-                children: [
-                  Icon(Icons.download_rounded, size: 14, color: Color(0xFF7AA67A)),
-                  SizedBox(width: 3),
-                  Text(
-                    '儲存離線版',
-                    style: TextStyle(fontSize: 12, color: Color(0xFF7AA67A), fontWeight: FontWeight.w600),
-                  ),
-                ],
-              ),
-            ),
-          ],
-        ),
-      );
-    } else {
-      return Container(
-        width: double.infinity,
-        color: const Color(0xFFBF7A5A).withValues(alpha: 0.12),
-        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Row(
+          : Column(
               children: [
-                Icon(Icons.wifi_off_rounded, size: 15, color: Color(0xFFBF7A5A)),
-                SizedBox(width: 6),
-                Text(
-                  '無網路連線・顯示離線地圖（無法使用導航）',
-                  style: TextStyle(fontSize: 12, color: Color(0xFFBF7A5A), fontWeight: FontWeight.w600),
+                _NetworkBanner(
+                  isOnline: _isOnline,
+                  lastUpdatedAt: _lastUpdatedAt,
+                  locationLabel: _locationLabel,
+                ),
+                Expanded(
+                  child: TabBarView(
+                    controller: _tabController,
+                    children: [
+                      _buildListTab(),
+                      _buildMapTab(),
+                    ],
+                  ),
                 ),
               ],
             ),
-            if (lastUpdatedAt != null)
-              Padding(
-                padding: const EdgeInsets.only(left: 21, top: 2),
-                child: Text(
-                  '上次更新：$lastUpdatedAt',
-                  style: const TextStyle(fontSize: 11, color: Color(0xFFBF7A5A)),
-                ),
-              ),
+    );
+  }
+
+  // ── 清單頁 ───────────────────────────────────────────────
+  Widget _buildListTab() {
+    if (_shelters.isEmpty) {
+      return Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(Icons.cloud_off_rounded, size: 52, color: _textSecondary.withValues(alpha: 0.4)),
+            const SizedBox(height: 12),
+            Text('尚未下載離線資料', style: TextStyle(fontSize: 15, color: _textSecondary)),
+            Text('請連上網路後點選右上角下載', style: TextStyle(fontSize: 13, color: _textSecondary.withValues(alpha: 0.7))),
           ],
         ),
       );
     }
+
+    return ListView.separated(
+      padding: const EdgeInsets.all(16),
+      itemCount: _shelters.length,
+      separatorBuilder: (_, _) => const SizedBox(height: 10),
+      itemBuilder: (context, index) {
+        final s = _shelters[index];
+        final isNearest = index == 0 && s.distanceKm != null;
+        final isFull = s.status == '即將滿員';
+        final statusColor = isFull ? _orange : _green;
+
+        return Container(
+          decoration: BoxDecoration(
+            color: _card,
+            borderRadius: BorderRadius.circular(18),
+            border: isNearest ? Border.all(color: _green, width: 1.5) : null,
+            boxShadow: [
+              BoxShadow(
+                color: const Color(0xFF3D2C1E).withValues(alpha: 0.05),
+                blurRadius: 10,
+                offset: const Offset(0, 3),
+              ),
+            ],
+          ),
+          child: Column(
+            children: [
+              // 最近避難所標籤
+              if (isNearest)
+                Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.symmetric(vertical: 4),
+                  decoration: BoxDecoration(
+                    color: _green.withValues(alpha: 0.1),
+                    borderRadius: const BorderRadius.vertical(top: Radius.circular(16)),
+                  ),
+                  child: const Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Icon(Icons.near_me_rounded, size: 13, color: _green),
+                      SizedBox(width: 4),
+                      Text('距你最近的避難所', style: TextStyle(fontSize: 12, color: _green, fontWeight: FontWeight.w700)),
+                    ],
+                  ),
+                ),
+              Padding(
+                padding: const EdgeInsets.all(16),
+                child: Row(
+                  children: [
+                    // 編號
+                    Container(
+                      width: 40,
+                      height: 40,
+                      decoration: BoxDecoration(
+                        color: _green.withValues(alpha: 0.1),
+                        shape: BoxShape.circle,
+                      ),
+                      child: Center(
+                        child: Text(
+                          '${index + 1}',
+                          style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w800, color: _green),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 14),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(s.name,
+                              style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w700, color: _textPrimary)),
+                          const SizedBox(height: 5),
+                          Row(
+                            children: [
+                              Icon(Icons.people_outline_rounded, size: 13, color: _textSecondary),
+                              const SizedBox(width: 3),
+                              Text(s.capacity, style: TextStyle(fontSize: 12, color: _textSecondary)),
+                              if (s.distanceKm != null) ...[
+                                const SizedBox(width: 10),
+                                Icon(Icons.directions_walk_rounded, size: 13, color: _textSecondary),
+                                const SizedBox(width: 3),
+                                Text(
+                                  s.distanceKm! < 1
+                                      ? '${(s.distanceKm! * 1000).round()} m'
+                                      : '${s.distanceKm!.toStringAsFixed(1)} km',
+                                  style: TextStyle(
+                                    fontSize: 12,
+                                    color: isNearest ? _green : _textSecondary,
+                                    fontWeight: isNearest ? FontWeight.w700 : FontWeight.normal,
+                                  ),
+                                ),
+                              ],
+                            ],
+                          ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Column(
+                      crossAxisAlignment: CrossAxisAlignment.end,
+                      children: [
+                        Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                          decoration: BoxDecoration(
+                            color: statusColor.withValues(alpha: 0.1),
+                            borderRadius: BorderRadius.circular(20),
+                          ),
+                          child: Text(s.status,
+                              style: TextStyle(fontSize: 11, fontWeight: FontWeight.w600, color: statusColor)),
+                        ),
+                        const SizedBox(height: 8),
+                        // 導航（有網路才啟用）
+                        GestureDetector(
+                          onTap: _isOnline ? () => _openNavigation(s) : null,
+                          child: Row(
+                            children: [
+                              Icon(Icons.directions_rounded,
+                                  size: 14,
+                                  color: _isOnline ? _green : _textSecondary.withValues(alpha: 0.3)),
+                              const SizedBox(width: 3),
+                              Text('導航',
+                                  style: TextStyle(
+                                    fontSize: 12,
+                                    color: _isOnline ? _green : _textSecondary.withValues(alpha: 0.3),
+                                    fontWeight: _isOnline ? FontWeight.w600 : FontWeight.normal,
+                                  )),
+                            ],
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  // ── 地圖頁 ───────────────────────────────────────────────
+  Widget _buildMapTab() {
+    if (_tileProvider == null) {
+      return const Center(child: CircularProgressIndicator());
+    }
+
+    final center = _frequentLocation ??
+        _currentLocation ??
+        LatLng(_shelters.isNotEmpty ? _shelters[0].lat : 23.962, _shelters.isNotEmpty ? _shelters[0].lng : 120.969);
+
+    return FlutterMap(
+      mapController: _mapController,
+      options: MapOptions(
+        initialCenter: center,
+        initialZoom: 14.0,
+        maxZoom: 18,
+        minZoom: 10,
+      ),
+      children: [
+        // 地圖磚層（支援離線快取）
+        TileLayer(
+          urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+          userAgentPackageName: 'com.example.disaster_app',
+          tileProvider: _tileProvider!,
+        ),
+
+        // 防空洞標記
+        MarkerLayer(
+          markers: [
+            // 使用者常出現位置（藍色）
+            if (_frequentLocation != null)
+              Marker(
+                point: _frequentLocation!,
+                width: 44,
+                height: 44,
+                child: _UserLocationMarker(label: '常出現位置'),
+              ),
+            // 當前 GPS 位置（若與常出現位置不同）
+            if (_currentLocation != null && _frequentLocation != null &&
+                _calcDistKm(_currentLocation!.latitude, _currentLocation!.longitude,
+                        _frequentLocation!.latitude, _frequentLocation!.longitude) >
+                    0.05)
+              Marker(
+                point: _currentLocation!,
+                width: 36,
+                height: 36,
+                child: _CurrentPosMarker(),
+              ),
+            // 避難所標記
+            ..._shelters.asMap().entries.map((entry) {
+              final index = entry.key;
+              final s = entry.value;
+              return Marker(
+                point: LatLng(s.lat, s.lng),
+                width: 44,
+                height: 54,
+                child: GestureDetector(
+                  onTap: () => _showShelterInfo(s, index),
+                  child: _ShelterMarker(number: index + 1, isNearest: index == 0),
+                ),
+              );
+            }),
+          ],
+        ),
+
+        // 比例尺
+        const SimpleAttributionWidget(
+          source: Text('© OpenStreetMap contributors', style: TextStyle(fontSize: 10)),
+        ),
+      ],
+    );
+  }
+
+  // 點擊地圖標記顯示避難所資訊
+  void _showShelterInfo(Shelter s, int index) {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: _card,
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(20))),
+      builder: (_) => Padding(
+        padding: const EdgeInsets.all(20),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Container(
+                  width: 32,
+                  height: 32,
+                  decoration: BoxDecoration(color: _green.withValues(alpha: 0.1), shape: BoxShape.circle),
+                  child: Center(
+                    child: Text('${index + 1}',
+                        style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w800, color: _green)),
+                  ),
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Text(s.name,
+                      style: const TextStyle(fontSize: 17, fontWeight: FontWeight.w700, color: _textPrimary)),
+                ),
+              ],
+            ),
+            const SizedBox(height: 12),
+            _InfoRow(Icons.people_outline_rounded, '容納人數', s.capacity),
+            _InfoRow(Icons.shield_rounded, '目前狀態', s.status,
+                valueColor: s.status == '即將滿員' ? _orange : _green),
+            if (s.distanceKm != null)
+              _InfoRow(Icons.directions_walk_rounded, '距你距離',
+                  s.distanceKm! < 1 ? '${(s.distanceKm! * 1000).round()} 公尺' : '${s.distanceKm!.toStringAsFixed(1)} 公里'),
+            const SizedBox(height: 16),
+            SizedBox(
+              width: double.infinity,
+              child: ElevatedButton.icon(
+                onPressed: _isOnline ? () { Navigator.pop(context); _openNavigation(s); } : null,
+                icon: const Icon(Icons.directions_rounded),
+                label: Text(_isOnline ? 'GPS 導航前往' : '無網路，無法導航'),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: _green,
+                  foregroundColor: Colors.white,
+                  disabledBackgroundColor: _textSecondary.withValues(alpha: 0.2),
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                  padding: const EdgeInsets.symmetric(vertical: 12),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// ── 使用者常出現位置標記 ──────────────────────────────────
+class _UserLocationMarker extends StatelessWidget {
+  final String label;
+  const _UserLocationMarker({required this.label});
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Container(
+          width: 32,
+          height: 32,
+          decoration: BoxDecoration(
+            color: const Color(0xFF4A90D9),
+            shape: BoxShape.circle,
+            border: Border.all(color: Colors.white, width: 2.5),
+            boxShadow: [BoxShadow(color: const Color(0xFF4A90D9).withValues(alpha: 0.4), blurRadius: 8)],
+          ),
+          child: const Icon(Icons.person_pin_rounded, color: Colors.white, size: 18),
+        ),
+      ],
+    );
+  }
+}
+
+// ── 當前 GPS 位置標記（綠點）────────────────────────────
+class _CurrentPosMarker extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: 14,
+      height: 14,
+      decoration: BoxDecoration(
+        color: const Color(0xFF4CAF50),
+        shape: BoxShape.circle,
+        border: Border.all(color: Colors.white, width: 2),
+        boxShadow: [BoxShadow(color: const Color(0xFF4CAF50).withValues(alpha: 0.5), blurRadius: 6)],
+      ),
+    );
+  }
+}
+
+// ── 防空洞地圖標記 ───────────────────────────────────────
+class _ShelterMarker extends StatelessWidget {
+  final int number;
+  final bool isNearest;
+
+  const _ShelterMarker({required this.number, required this.isNearest});
+
+  @override
+  Widget build(BuildContext context) {
+    const green = Color(0xFF7AA67A);
+    const orange = Color(0xFFBF7A5A);
+    final color = isNearest ? orange : green;
+
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Container(
+          width: isNearest ? 40 : 34,
+          height: isNearest ? 40 : 34,
+          decoration: BoxDecoration(
+            color: color,
+            shape: BoxShape.circle,
+            border: Border.all(color: Colors.white, width: 2),
+            boxShadow: [BoxShadow(color: color.withValues(alpha: 0.4), blurRadius: 6)],
+          ),
+          child: Center(
+            child: Text(
+              '$number',
+              style: TextStyle(
+                color: Colors.white,
+                fontSize: isNearest ? 16 : 13,
+                fontWeight: FontWeight.w800,
+              ),
+            ),
+          ),
+        ),
+        CustomPaint(size: const Size(10, 6), painter: _PinTailPainter(color)),
+      ],
+    );
+  }
+}
+
+class _PinTailPainter extends CustomPainter {
+  final Color color;
+  const _PinTailPainter(this.color);
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final paint = Paint()..color = color;
+    final path = ui.Path()
+      ..moveTo(0, 0)
+      ..lineTo(size.width, 0)
+      ..lineTo(size.width / 2, size.height)
+      ..close();
+    canvas.drawPath(path, paint);
+  }
+
+  @override
+  bool shouldRepaint(_) => false;
+}
+
+// ── 網路狀態橫幅 ─────────────────────────────────────────
+class _NetworkBanner extends StatelessWidget {
+  final bool isOnline;
+  final String? lastUpdatedAt;
+  final String locationLabel;
+
+  const _NetworkBanner({required this.isOnline, this.lastUpdatedAt, required this.locationLabel});
+
+  @override
+  Widget build(BuildContext context) {
+    const green = Color(0xFF7AA67A);
+    const orange = Color(0xFFBF7A5A);
+    final color = isOnline ? green : orange;
+
+    return Container(
+      width: double.infinity,
+      color: color.withValues(alpha: 0.1),
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 7),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(isOnline ? Icons.wifi_rounded : Icons.wifi_off_rounded, size: 14, color: color),
+              const SizedBox(width: 5),
+              Text(
+                isOnline ? '已連線・顯示最新防空洞位置・可使用 GPS 導航' : '無網路・離線模式・無法使用導航',
+                style: TextStyle(fontSize: 11, color: color, fontWeight: FontWeight.w600),
+              ),
+            ],
+          ),
+          const SizedBox(height: 2),
+          Row(
+            children: [
+              const Icon(Icons.location_on_outlined, size: 13, color: Color(0xFF8C7B6E)),
+              const SizedBox(width: 4),
+              Text(locationLabel, style: const TextStyle(fontSize: 11, color: Color(0xFF8C7B6E))),
+              if (!isOnline && lastUpdatedAt != null) ...[
+                const SizedBox(width: 8),
+                const Text('・', style: TextStyle(fontSize: 11, color: Color(0xFF8C7B6E))),
+                const SizedBox(width: 4),
+                Text('上次更新 $lastUpdatedAt', style: const TextStyle(fontSize: 11, color: Color(0xFF8C7B6E))),
+              ],
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ── 避難所資訊列 ─────────────────────────────────────────
+class _InfoRow extends StatelessWidget {
+  final IconData icon;
+  final String label;
+  final String value;
+  final Color? valueColor;
+
+  const _InfoRow(this.icon, this.label, this.value, {this.valueColor});
+
+  @override
+  Widget build(BuildContext context) {
+    const textSecondary = Color(0xFF8C7B6E);
+    const textPrimary = Color(0xFF3D2C1E);
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 5),
+      child: Row(
+        children: [
+          Icon(icon, size: 16, color: textSecondary),
+          const SizedBox(width: 8),
+          Text(label, style: const TextStyle(fontSize: 13, color: textSecondary)),
+          const Spacer(),
+          Text(value,
+              style: TextStyle(
+                  fontSize: 13,
+                  fontWeight: FontWeight.w600,
+                  color: valueColor ?? textPrimary)),
+        ],
+      ),
+    );
   }
 }
