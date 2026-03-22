@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
 import 'dart:ui' as ui;
@@ -117,33 +118,46 @@ class _ShelterScreenState extends State<ShelterScreen> with SingleTickerProvider
 
   // ── 初始化 ──────────────────────────────────────────────
   Future<void> _init() async {
-    final connectivity = await Connectivity().checkConnectivity();
-    final online = connectivity.any((r) => r != ConnectivityResult.none);
+    // 1. 網路狀態（加 timeout 避免卡住）
+    bool online = false;
+    try {
+      final connectivity = await Connectivity()
+          .checkConnectivity()
+          .timeout(const Duration(seconds: 5));
+      online = connectivity.any((r) => r != ConnectivityResult.none);
+    } catch (_) {}
 
-    // 設定地圖磚快取（持久化到硬碟）
-    final dir = await getApplicationCacheDirectory();
-    _tileProvider = CachedTileProvider(
-      store: HiveCacheStore('${dir.path}/map_tiles'),
-      maxStale: const Duration(days: 30),
-    );
+    // 2. 地圖磚快取（失敗時降級為 NetworkTileProvider）
+    try {
+      final dir = await getApplicationCacheDirectory()
+          .timeout(const Duration(seconds: 5));
+      _tileProvider = CachedTileProvider(
+        store: HiveCacheStore('${dir.path}/map_tiles'),
+        maxStale: const Duration(days: 30),
+      );
+    } catch (_) {
+      _tileProvider = NetworkTileProvider();
+    }
 
-    // 取得 GPS 位置並更新常出現位置
+    // 3. GPS 位置（最多等 8 秒，失敗也繼續）
     await _updateLocation();
 
-    // 載入避難所資料
+    // 4. 載入避難所資料
     if (online) {
       await _loadOnlineData();
     } else {
       await _loadOfflineData();
     }
 
-    // 依距離排序
+    // 5. 依距離排序
     _sortByDistance();
 
-    setState(() {
-      _isOnline = online;
-      _isLoading = false;
-    });
+    if (mounted) {
+      setState(() {
+        _isOnline = online;
+        _isLoading = false;
+      });
+    }
   }
 
   // ── GPS 位置 + 常出現位置計算 ────────────────────────────
@@ -166,7 +180,7 @@ class _ShelterScreenState extends State<ShelterScreen> with SingleTickerProvider
 
       final pos = await Geolocator.getCurrentPosition(
         locationSettings: const LocationSettings(accuracy: LocationAccuracy.high),
-      );
+      ).timeout(const Duration(seconds: 8));
       _currentLocation = LatLng(pos.latitude, pos.longitude);
 
       // 儲存到歷史記錄（最多保留 30 筆）
@@ -186,7 +200,9 @@ class _ShelterScreenState extends State<ShelterScreen> with SingleTickerProvider
       _frequentLocation = LatLng(avgLat, avgLng);
 
       setState(() => _locationLabel = '常出現位置已更新（${history.length} 次記錄）');
-    } catch (e) {
+    } on TimeoutException {
+      setState(() => _locationLabel = '位置偵測逾時，使用預設資料');
+    } catch (_) {
       setState(() => _locationLabel = '無法取得位置');
     }
   }
