@@ -1,12 +1,20 @@
 import 'package:flutter/material.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'screens/home_screen.dart';
+import 'screens/register_screen.dart';
 
-void main() {
-  runApp(const DisasterApp());
+const _prefsKeyUser = 'app_user';
+
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  final prefs = await SharedPreferences.getInstance();
+  final isRegistered = prefs.containsKey(_prefsKeyUser);
+  runApp(DisasterApp(isRegistered: isRegistered));
 }
 
 class DisasterApp extends StatelessWidget {
-  const DisasterApp({super.key});
+  final bool isRegistered;
+  const DisasterApp({super.key, required this.isRegistered});
 
   @override
   Widget build(BuildContext context) {
@@ -41,7 +49,7 @@ class DisasterApp extends StatelessWidget {
         ),
         dividerColor: const Color(0xFFE8E0D5),
       ),
-      home: const HomeScreen(),
+      home: isRegistered ? const HomeScreen() : const RegisterScreen(),
     );
   }
 }
