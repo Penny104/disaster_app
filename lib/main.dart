@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:firebase_core/firebase_core.dart';
+import 'firebase_options.dart';
 import 'screens/home_screen.dart';
 import 'screens/register_screen.dart';
 
@@ -7,6 +9,7 @@ const _prefsKeyUser = 'app_user';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
   final prefs = await SharedPreferences.getInstance();
   final isRegistered = prefs.containsKey(_prefsKeyUser);
   runApp(DisasterApp(isRegistered: isRegistered));

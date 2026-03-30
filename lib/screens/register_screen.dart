@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
 import '../models/user.dart';
 import 'home_screen.dart';
 
@@ -93,12 +94,30 @@ class _RegisterScreenState extends State<RegisterScreen> {
         registeredAt: DateTime.now(),
       );
 
+      // 存到本機
       final prefs = await SharedPreferences.getInstance();
       await prefs.setString(_prefsKeyUser, jsonEncode(user.toJson()));
+
+      // 存到 Firestore 雲端
+      await FirebaseFirestore.instance
+          .collection('users')
+          .doc(user.id)
+          .set(user.toJson());
 
       if (mounted) {
         Navigator.of(context).pushReplacement(
           MaterialPageRoute(builder: (_) => const HomeScreen()),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('註冊失敗：$e'),
+            backgroundColor: const Color(0xFFC4553A),
+            behavior: SnackBarBehavior.floating,
+            margin: const EdgeInsets.all(16),
+          ),
         );
       }
     } finally {
